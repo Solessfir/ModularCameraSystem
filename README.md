@@ -44,14 +44,16 @@ Create a Blueprint child and override:
 Class defaults:
 
 - **Camera Type Tag** - gameplay tag queryable when a kind of mode is active (e.g. ADS) without knowing the class
-- **Field Of View / View Pitch Min / View Pitch Max** - view clamps
+- **Field Of View / View Pitch Min / View Pitch Max** - base FOV and allowed pivot pitch range
 - **Blend Time / Blend Function / Blend Exponent** - how this mode blends in over the mode(s) below it
+
+Call **Reset Interpolation** on a mode to complete its blend on the next update.
 
 ### Camera Mode First Person
 Pins the camera to a socket/bone on the character mesh (default `head`) instead of the base class's eye-height pivot.
 
 - **Head Socket Name** - socket/bone the camera pivots to
-- **Fallback** - Actor Eyes view point if socket is not found
+- **Fallback** - pawn view location when the mesh or socket is missing; actor location for non-pawn owners
 
 ### Camera Mode Third Person
 Pitch-driven offset curve (`Target Offset X/Y/Z`) plus wall-penetration avoidance so the camera doesn't clip through geometry. Curves are read from the class defaults every frame, so tweaking them on a Blueprint while PIE is running updates the live camera immediately - no restart needed.
@@ -61,10 +63,9 @@ Pitch-driven offset curve (`Target Offset X/Y/Z`) plus wall-penetration avoidanc
 - **Prevent Penetration / Do Predictive Avoidance** - collision avoidance toggles
 - **Trace Channel** - collision channel the feelers sweep against (default `Camera`)
 - **Run Async Collision** - runs feeler 0's sweep off the game thread; result up to 1 frame stale. Predictive feelers always run async regardless
-- **Penetration Avoidance Feelers** - feeler rays swept from the pivot. Index 0 = main collision check, index 1+ = predictive (angled off-axis, ease in before you turn into a wall)
+- **Penetration Avoidance Feelers** - sweeps from the penetration target's safe anchor. Index 0 = main collision check, index 1+ = predictive (angled off-axis, ease in before you turn into a wall)
 
-Camera lag (off by default) smooths the pivot itself, not the final offset camera position - so
-free-rotating the camera around the target has no lag, only the target's own movement/rotation does:
+Camera lag (off by default) smooths the pivot location and rotation before applying the offset curves. Rotation lag also affects controller-driven free look:
 
 - **Enable Camera Lag / Enable Camera Rotation Lag** - turn location/rotation smoothing on
 - **Camera Lag Speed / Camera Rotation Lag Speed** - how fast it catches up (lower = more lag, 0 = instant/no lag)
@@ -94,11 +95,13 @@ Camera Mode Component → Pop Camera Mode (ADS_CameraMode_BP)
 
 Console command `ModularCameraSystem.ShowDebug 1` draws the local player's Camera Mode Component debug info (FOV/location/rotation and every camera mode on the stack with its current blend weight) - no setup needed. Run it again with `0` to turn off.
 
-`Camera Mode Third Person` also logs to the [Visual Logger](https://dev.epicgames.com/documentation/en-us/unreal-engine/visual-logger) under category `LogCameraSystem`: each penetration-avoidance feeler ray (`red` = blocked, `green` = clear) and the final resolved camera location with its blocked percentage.
+`Camera Mode Third Person` also logs to the [Visual Logger](https://dev.epicgames.com/documentation/en-us/unreal-engine/visual-logger) under category `LogModularCameraSystem`: each penetration-avoidance feeler ray (`red` = blocked, `green` = clear) and the final resolved camera location with its blocked percentage.
 
 ## Camera Assist Interface (optional)
 
 Implement **Camera Assist Interface** on the Owning Pawn, its Controller, or a custom target returned via `GetCameraPreventPenetrationTarget` if you need to customize penetration behavior.
+
+The owning actor supplies the custom penetration target. Ignore lists are queried and penetration notifications are sent to the owning actor, its controller, and the custom target when they implement the interface.
 
 For custom penetration targets, prefer a capsule, box, or sphere collision root and keep the main feeler small enough to fit inside it. Other collision roots use a nearest-point fallback.
 
@@ -106,5 +109,19 @@ For custom penetration targets, prefer a capsule, box, or sphere collision root 
 |---|---|
 | **Get Camera Prevent Penetration Target** | Redirect the focal actor away from the view target (return none/null to keep the view target) |
 | **Get Ignored Actors For Camera Penetration** | Actors the camera may always pass through (vehicle, extra targets, …) |
-| **On Camera Penetrating Target** | Fired once when the camera gets too close (e.g. hide the mesh) |
-| **On Camera Stopped Penetrating Target** | Fired once when it's no longer too close (e.g. show the mesh again) |
+| **On Camera Penetrating Target** | Fired once per recipient when it enters the penetrating state (e.g. hide the mesh) |
+| **On Camera Stopped Penetrating Target** | Fired when a recipient leaves the penetrating state, including target changes and mode/component deactivation (e.g. show the mesh again) |
+
+## Regression tests
+
+Native regression tests are included in the editor module. Run this command from your project's editor console:
+
+```text
+Automation RunTests ModularCameraSystem
+```
+
+Validated on Linux with Unreal Engine 5.8.3, using Development editor and game builds.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
