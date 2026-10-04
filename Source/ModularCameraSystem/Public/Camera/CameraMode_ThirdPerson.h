@@ -181,6 +181,7 @@ protected:
 	FVector CurrentCrouchOffset = FVector::ZeroVector;
 
 	bool bWasPenetratingTarget = false;
+	uint32 PenetrationNotificationRevision = 0;
 
 	TArray<TWeakObjectPtr<UObject>> PenetrationNotificationRecipients;
 

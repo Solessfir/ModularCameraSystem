@@ -15,9 +15,9 @@ FVector UCameraMode_FirstPerson::GetPivotLocation_Implementation() const
 	{
 		if (const ACharacter* TargetCharacter = Cast<ACharacter>(TargetPawn))
 		{
-			if (TargetCharacter->GetMesh()->DoesSocketExist(HeadSocketName))
+			if (const USkeletalMeshComponent* Mesh = TargetCharacter->GetMesh(); Mesh && Mesh->DoesSocketExist(HeadSocketName))
 			{
-				return TargetCharacter->GetMesh()->GetSocketLocation(HeadSocketName);
+				return Mesh->GetSocketLocation(HeadSocketName);
 			}
 		}
 		return TargetPawn->GetPawnViewLocation();

@@ -30,6 +30,9 @@ class MODULARCAMERASYSTEM_API UCameraModeComponent : public UCameraComponent
 
 public:
 	virtual void OnRegister() override;
+	virtual void OnUnregister() override;
+	virtual void Activate(bool bReset = false) override;
+	virtual void Deactivate() override;
 
 	virtual void GetCameraView(float DeltaTime, FMinimalViewInfo& DesiredView) override;
 
@@ -95,4 +98,10 @@ protected:
 
 	// Offset applied to the field of view. The offset is only for one frame, it gets cleared once it is applied.
 	float FieldOfViewOffset = 0.f;
+
+	// Restore the component's original view when camera modes stop driving it.
+	FVector SavedRelativeLocation = FVector::ZeroVector;
+	FRotator SavedRelativeRotation = FRotator::ZeroRotator;
+	float SavedFieldOfView = 0.f;
+	bool bHasSavedCameraView = false;
 };

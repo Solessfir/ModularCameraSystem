@@ -10,12 +10,51 @@
 
 void UCameraModeComponent::OnRegister()
 {
-	Super::OnRegister();
-
 	if (!CameraModeStack)
 	{
 		CameraModeStack = NewObject<UCameraModeStack>(this);
 		check(CameraModeStack);
+	}
+
+	// Registration can auto-activate and query the camera from activation callbacks.
+	Super::OnRegister();
+
+	if (IsActive() && IsRegistered())
+	{
+		CameraModeStack->ActivateStack();
+	}
+	else
+	{
+		CameraModeStack->DeactivateStack();
+	}
+}
+
+void UCameraModeComponent::OnUnregister()
+{
+	Super::OnUnregister();
+
+	// Unregistration can run during GC, when Blueprint mode hooks are unsafe.
+	if (CameraModeStack && !HasAnyFlags(RF_BeginDestroyed) && !IsUnreachable())
+	{
+		CameraModeStack->DeactivateStack();
+	}
+}
+
+void UCameraModeComponent::Activate(bool bReset)
+{
+	Super::Activate(bReset);
+	if (CameraModeStack && IsActive() && IsRegistered())
+	{
+		CameraModeStack->ActivateStack();
+	}
+}
+
+void UCameraModeComponent::Deactivate()
+{
+	Super::Deactivate();
+	if (CameraModeStack && !IsActive())
+	{
+		CameraModeStack->DeactivateStack();
 	}
 }
 
@@ -23,25 +62,50 @@ void UCameraModeComponent::GetCameraView(float DeltaTime, FMinimalViewInfo& Desi
 {
 	check(CameraModeStack);
 
+	if (!bHasSavedCameraView)
+	{
+		SavedRelativeLocation = GetRelativeLocation();
+		SavedRelativeRotation = GetRelativeRotation();
+		SavedFieldOfView = FieldOfView;
+	}
+
+	// Activation delegates can query the view before Activate or Deactivate returns.
+	if (IsActive() && IsRegistered())
+	{
+		CameraModeStack->ActivateStack();
+	}
+	else
+	{
+		CameraModeStack->DeactivateStack();
+	}
+
 	UpdateCameraModes();
 
 	FCameraModeView CameraModeView;
 	if (!CameraModeStack->EvaluateStack(DeltaTime, CameraModeView))
 	{
-		// A missing default mode (or an explicitly deactivated stack) must not produce the
-		// zero-initialized FCameraModeView at world origin. Preserve normal camera behavior.
-		Super::GetCameraView(DeltaTime, DesiredView);
-		DesiredView.FOV += FieldOfViewOffset;
+		if (bHasSavedCameraView)
+		{
+			SetRelativeLocationAndRotation(SavedRelativeLocation, SavedRelativeRotation);
+			FieldOfView = SavedFieldOfView;
+			bHasSavedCameraView = false;
+		}
+
+		const float BaseFieldOfView = FieldOfView;
+		FieldOfView += FieldOfViewOffset;
 		FieldOfViewOffset = 0.f;
+		Super::GetCameraView(DeltaTime, DesiredView);
+		FieldOfView = BaseFieldOfView;
 		return;
 	}
+	bHasSavedCameraView = true;
 
 	// Keep player controller in sync with the latest view.
 	if (const APawn* TargetPawn = Cast<APawn>(GetTargetActor()))
 	{
 		if (APlayerController* PC = TargetPawn->GetController<APlayerController>())
 		{
-			PC->SetControlRotation(CameraModeView.ControlRotation);
+			PC->SetControlRotation(CameraModeView.ControlRotation.GetNormalized());
 		}
 	}
 
@@ -53,10 +117,14 @@ void UCameraModeComponent::GetCameraView(float DeltaTime, FMinimalViewInfo& Desi
 	SetWorldLocationAndRotation(CameraModeView.Location, CameraModeView.Rotation);
 	FieldOfView = CameraModeView.FieldOfView;
 
-	// Let UCameraComponent populate the complete FMinimalViewInfo. Because the component transform
-	// and FOV were set above, this retains the mode result while also honoring additive offsets,
-	// XR, first-person parameters, ortho settings, overscan, aspect constraints and motion vectors.
+	// Modes own the view rotation; preserve the base camera's other settings and XR handling.
+	const bool bSavedUsePawnControlRotation = bUsePawnControlRotation;
+	if (Cast<APawn>(GetOwner()))
+	{
+		bUsePawnControlRotation = false;
+	}
 	Super::GetCameraView(DeltaTime, DesiredView);
+	bUsePawnControlRotation = bSavedUsePawnControlRotation;
 }
 
 UCameraModeComponent* UCameraModeComponent::FindCameraComponent(const AActor* Actor)
@@ -78,6 +146,10 @@ void UCameraModeComponent::UpdateCameraModes()
 		if (const TSubclassOf<UCameraMode> CameraMode = DetermineCameraMode())
 		{
 			CameraModeStack->PushCameraMode(CameraMode);
+		}
+		else
+		{
+			CameraModeStack->ClearStack();
 		}
 	}
 }

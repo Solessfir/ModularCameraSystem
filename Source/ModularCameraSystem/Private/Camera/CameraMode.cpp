@@ -129,7 +129,13 @@ FRotator UCameraMode::GetPivotRotation_Implementation() const
 
 void UCameraMode::UpdateCameraMode(const float DeltaTime)
 {
+	const FRotator PreviousRotation = bHasPendingRotationReference ? PendingRotationReference : View.Rotation;
+	const FRotator PreviousControlRotation = bHasPendingRotationReference ? PendingControlRotationReference : View.ControlRotation;
+	bHasPendingRotationReference = false;
 	UpdateView(DeltaTime);
+	// Keep each mode on a continuous angle branch so stack reordering cannot change the blend's path.
+	View.Rotation = PreviousRotation + (View.Rotation - PreviousRotation).GetNormalized();
+	View.ControlRotation = PreviousControlRotation + (View.ControlRotation - PreviousControlRotation).GetNormalized();
 	UpdateBlending(DeltaTime);
 }
 
@@ -236,6 +242,7 @@ void UCameraMode::UpdateBlending(const float DeltaTime)
 
 	if (bResetInterpolation)
 	{
+		BlendAlpha = 1.f;
 		BlendWeight = 1.f;
 		bResetInterpolation = false;
 	}
@@ -295,11 +302,19 @@ void UCameraModeStack::ActivateStack()
 	if (!bIsActive)
 	{
 		bIsActive = true;
+		++StackRevision;
 
-		for (UCameraMode* CameraMode : CameraModeStack)
+		const TArray<TObjectPtr<UCameraMode>> Modes = CameraModeStack;
+		for (UCameraMode* CameraMode : Modes)
 		{
-			check(CameraMode);
-			CameraMode->OnActivation();
+			if (!bIsActive)
+			{
+				break;
+			}
+			if (CameraModeStack.Contains(CameraMode))
+			{
+				ActivateCameraMode(CameraMode);
+			}
 		}
 	}
 }
@@ -309,11 +324,16 @@ void UCameraModeStack::DeactivateStack()
 	if (bIsActive)
 	{
 		bIsActive = false;
+		++StackRevision;
 
-		for (UCameraMode* CameraMode : CameraModeStack)
+		const TArray<TObjectPtr<UCameraMode>> Modes = CameraModeStack;
+		for (UCameraMode* CameraMode : Modes)
 		{
-			check(CameraMode);
-			CameraMode->OnDeactivation();
+			if (bIsActive)
+			{
+				break;
+			}
+			DeactivateCameraMode(CameraMode);
 		}
 	}
 }
@@ -321,6 +341,25 @@ void UCameraModeStack::DeactivateStack()
 bool UCameraModeStack::IsStackActivate() const
 {
 	return bIsActive;
+}
+
+void UCameraModeStack::ClearStack()
+{
+	if (CameraModeStack.IsEmpty())
+	{
+		return;
+	}
+
+	TArray<TObjectPtr<UCameraMode>> RemovedModes = MoveTemp(CameraModeStack);
+	bHasEvaluatedView = false;
+	++StackRevision;
+	for (UCameraMode* CameraMode : RemovedModes)
+	{
+		if (!bIsActive || !CameraModeStack.Contains(CameraMode))
+		{
+			DeactivateCameraMode(CameraMode);
+		}
+	}
 }
 
 void UCameraModeStack::PushCameraMode(const TSubclassOf<UCameraMode> CameraModeClass)
@@ -358,12 +397,36 @@ void UCameraModeStack::PushCameraMode(const TSubclassOf<UCameraMode> CameraModeC
 
 	if (ExistingStackIndex != INDEX_NONE)
 	{
+		// Preserve the other layers' contributions when this mode moves above them.
+		float RemainingContribution = 1.f;
+		for (int32 StackIndex = 0; StackIndex < ExistingStackIndex; ++StackIndex)
+		{
+			UCameraMode* OtherMode = CameraModeStack[StackIndex];
+			const float PreviousWeight = OtherMode->GetBlendWeight();
+			const float RemainingWithoutMode = RemainingContribution - ExistingStackContribution;
+			const float NewWeight = RemainingWithoutMode > 0.f
+				? PreviousWeight * RemainingContribution / RemainingWithoutMode
+				: 0.f;
+			OtherMode->SetBlendWeight(NewWeight);
+			RemainingContribution *= 1.f - PreviousWeight;
+		}
+
 		CameraModeStack.RemoveAt(ExistingStackIndex);
 		StackSize--;
 	}
 	else
 	{
 		ExistingStackContribution = 0.f;
+		CameraMode->bResetInterpolation = false;
+		CameraMode->bHasPendingRotationReference = false;
+		if (StackSize > 0)
+		{
+			FCameraModeView CurrentView;
+			BlendStack(CurrentView);
+			CameraMode->PendingRotationReference = CurrentView.Rotation;
+			CameraMode->PendingControlRotationReference = CurrentView.ControlRotation;
+			CameraMode->bHasPendingRotationReference = true;
+		}
 	}
 
 	// Decide what initial weight to start with.
@@ -379,14 +442,15 @@ void UCameraModeStack::PushCameraMode(const TSubclassOf<UCameraMode> CameraModeC
 
 	// Add new entry to top of stack.
 	CameraModeStack.Insert(CameraMode, 0);
+	++StackRevision;
 
 	// Make sure stack bottom is always weighted 100%.
 	CameraModeStack.Last()->SetBlendWeight(1.f);
 
 	// Let the camera mode know if it's being added to the stack.
-	if (ExistingStackIndex == INDEX_NONE)
+	if (bIsActive && ExistingStackIndex == INDEX_NONE)
 	{
-		CameraMode->OnActivation();
+		ActivateCameraMode(CameraMode);
 	}
 }
 
@@ -396,9 +460,36 @@ bool UCameraModeStack::EvaluateStack(const float DeltaTime, FCameraModeView& Out
 	{
 		return false;
 	}
+	// Activation callbacks can query the stack before lower layers have activated.
+	for (const UCameraMode* CameraMode : CameraModeStack)
+	{
+		if (!CameraMode->bIsActiveOnStack)
+		{
+			return false;
+		}
+	}
 
-	UpdateStack(DeltaTime);
+	if (!UpdateStack(DeltaTime) || !bIsActive || CameraModeStack.IsEmpty())
+	{
+		return false;
+	}
+	if (!bHasEvaluatedView)
+	{
+		// Modes pushed before the first evaluation have no updated lower view to seed their angle branch.
+		FRotator RotationReference = CameraModeStack.Last()->View.Rotation;
+		FRotator ControlRotationReference = CameraModeStack.Last()->View.ControlRotation;
+		for (int32 StackIndex = CameraModeStack.Num() - 2; StackIndex >= 0; --StackIndex)
+		{
+			UCameraMode* CameraMode = CameraModeStack[StackIndex];
+			CameraMode->View.Rotation = RotationReference + (CameraMode->View.Rotation - RotationReference).GetNormalized();
+			CameraMode->View.ControlRotation = ControlRotationReference + (CameraMode->View.ControlRotation - ControlRotationReference).GetNormalized();
+			const float Weight = CameraMode->GetBlendWeight();
+			RotationReference += (CameraMode->View.Rotation - RotationReference) * Weight;
+			ControlRotationReference += (CameraMode->View.ControlRotation - ControlRotationReference) * Weight;
+		}
+	}
 	BlendStack(OutCameraModeView);
+	bHasEvaluatedView = true;
 	return true;
 }
 
@@ -423,14 +514,35 @@ UCameraMode* UCameraModeStack::GetCameraModeInstance(const TSubclassOf<UCameraMo
 	return NewCameraMode;
 }
 
-void UCameraModeStack::UpdateStack(const float DeltaTime)
+void UCameraModeStack::ActivateCameraMode(UCameraMode* CameraMode)
+{
+	check(CameraMode);
+	if (!CameraMode->bIsActiveOnStack)
+	{
+		CameraMode->bIsActiveOnStack = true;
+		CameraMode->OnActivation();
+	}
+}
+
+void UCameraModeStack::DeactivateCameraMode(UCameraMode* CameraMode)
+{
+	check(CameraMode);
+	if (CameraMode->bIsActiveOnStack)
+	{
+		CameraMode->bIsActiveOnStack = false;
+		CameraMode->OnDeactivation();
+	}
+}
+
+bool UCameraModeStack::UpdateStack(const float DeltaTime)
 {
 	const int32 StackSize = CameraModeStack.Num();
 	if (StackSize <= 0)
 	{
-		return;
+		return false;
 	}
 
+	const uint32 UpdateRevision = StackRevision;
 	int32 RemoveCount = 0;
 	int32 RemoveIndex = INDEX_NONE;
 
@@ -440,6 +552,10 @@ void UCameraModeStack::UpdateStack(const float DeltaTime)
 		check(CameraMode);
 
 		CameraMode->UpdateCameraMode(DeltaTime);
+		if (StackRevision != UpdateRevision)
+		{
+			return false;
+		}
 
 		if (CameraMode->GetBlendWeight() >= 1.f)
 		{
@@ -452,16 +568,20 @@ void UCameraModeStack::UpdateStack(const float DeltaTime)
 
 	if (RemoveCount > 0)
 	{
-		for (int32 StackIndex = RemoveIndex; StackIndex < StackSize; ++StackIndex)
-		{
-			UCameraMode* CameraMode = CameraModeStack[StackIndex];
-			check(CameraMode);
-
-			CameraMode->OnDeactivation();
-		}
-
+		TArray<TObjectPtr<UCameraMode>> RemovedModes;
+		RemovedModes.Append(CameraModeStack.GetData() + RemoveIndex, RemoveCount);
 		CameraModeStack.RemoveAt(RemoveIndex, RemoveCount);
+		const uint32 RemovalRevision = ++StackRevision;
+		for (UCameraMode* CameraMode : RemovedModes)
+		{
+			if (!bIsActive || !CameraModeStack.Contains(CameraMode))
+			{
+				DeactivateCameraMode(CameraMode);
+			}
+		}
+		return StackRevision == RemovalRevision;
 	}
+	return true;
 }
 
 void UCameraModeStack::BlendStack(FCameraModeView& OutCameraModeView) const
@@ -483,7 +603,13 @@ void UCameraModeStack::BlendStack(FCameraModeView& OutCameraModeView) const
 		CameraMode = CameraModeStack[StackIndex];
 		check(CameraMode);
 
-		OutCameraModeView.Blend(CameraMode->GetCameraModeView(), CameraMode->GetBlendWeight());
+		const FCameraModeView& ModeView = CameraMode->GetCameraModeView();
+		const float Weight = CameraMode->GetBlendWeight();
+		const FRotator Rotation = OutCameraModeView.Rotation + (ModeView.Rotation - OutCameraModeView.Rotation) * Weight;
+		const FRotator ControlRotation = OutCameraModeView.ControlRotation + (ModeView.ControlRotation - OutCameraModeView.ControlRotation) * Weight;
+		OutCameraModeView.Blend(ModeView, Weight);
+		OutCameraModeView.Rotation = Rotation;
+		OutCameraModeView.ControlRotation = ControlRotation;
 	}
 }
 

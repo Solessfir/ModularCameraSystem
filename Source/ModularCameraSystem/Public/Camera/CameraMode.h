@@ -54,6 +54,8 @@ class MODULARCAMERASYSTEM_API UCameraMode : public UObject
 {
 	GENERATED_BODY()
 
+	friend class UCameraModeStack;
+
 public:
 	UCameraMode();
 
@@ -121,6 +123,12 @@ protected:
 
 	// View output produced by the camera mode.
 	FCameraModeView View;
+
+	// Keep the first blend on the current angle branch without replacing activation-authored view values.
+	FRotator PendingRotationReference;
+	FRotator PendingControlRotationReference;
+	bool bHasPendingRotationReference = false;
+	bool bIsActiveOnStack = false;
 
 	// The horizontal field of view (in degrees).
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Meta = (UIMin = 5.f, UIMax = 170.f, ClampMin = 5.f, ClampMax = 170.f), Category = "View")
@@ -195,6 +203,8 @@ public:
 
 	void DeactivateStack();
 
+	void ClearStack();
+
 	bool IsStackActivate() const;
 
 	void PushCameraMode(const TSubclassOf<UCameraMode> CameraModeClass);
@@ -213,11 +223,16 @@ public:
 protected:
 	UCameraMode* GetCameraModeInstance(const TSubclassOf<UCameraMode> CameraModeClass);
 
-	void UpdateStack(const float DeltaTime);
+	bool UpdateStack(const float DeltaTime);
+
+	void ActivateCameraMode(UCameraMode* CameraMode);
+	void DeactivateCameraMode(UCameraMode* CameraMode);
 
 	void BlendStack(FCameraModeView& OutCameraModeView) const;
 
 	bool bIsActive;
+	bool bHasEvaluatedView = false;
+	uint32 StackRevision = 0;
 
 	UPROPERTY()
 	TArray<TObjectPtr<UCameraMode>> CameraModeInstances;

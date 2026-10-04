@@ -1,6 +1,10 @@
 // Copyright Solessfir. All Rights Reserved.
 
 #include "Camera/CameraMode_ThirdPerson.h"
+#include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/PrimitiveComponent.h"
+#include "Components/SphereComponent.h"
 #include "Engine/Canvas.h"
 #include "GameFramework/CameraBlockingVolume.h"
 #include "Camera/CameraAssistInterface.h"
@@ -63,7 +67,8 @@ void UCameraMode_ThirdPerson::OnActivation_Implementation()
 	// Seed lag from the current pivot, so the first frame after activating never lags in from a
 	// stale (or zeroed) transform left over from the last time this mode was active.
 	PreviousDesiredRotation = GetPivotRotation();
-	PreviousDesiredLocation = GetPivotLocation();
+	PreviousDesiredRotation.Pitch = FMath::ClampAngle(PreviousDesiredRotation.Pitch, ViewPitchMin, ViewPitchMax);
+	PreviousDesiredLocation = GetPivotLocation() + CurrentCrouchOffset;
 }
 
 void UCameraMode_ThirdPerson::OnDeactivation_Implementation()
@@ -93,6 +98,8 @@ void UCameraMode_ThirdPerson::UpdateView_Implementation(const float DeltaTime)
 	ApplyCameraLag(DeltaTime, PivotLocation, DesiredRotation, DesiredLocation);
 	View.Rotation = DesiredRotation;
 
+	TargetZoomDistanceScale = FMath::Clamp(TargetZoomDistanceScale, MinZoomDistanceScale, MaxZoomDistanceScale);
+	ZoomDistanceScale = FMath::Clamp(ZoomDistanceScale, MinZoomDistanceScale, MaxZoomDistanceScale);
 	ZoomDistanceScale = FMath::FInterpTo(ZoomDistanceScale, TargetZoomDistanceScale, DeltaTime, ZoomInterpSpeed);
 
 	ApplyTargetOffsetFromRotation(DesiredRotation, DesiredLocation);
@@ -106,7 +113,7 @@ void UCameraMode_ThirdPerson::ApplyCameraLag(const float DeltaTime, const FVecto
 {
 	if (bEnableCameraRotationLag)
 	{
-		if (bUseCameraLagSubstepping && DeltaTime > CameraLagMaxTimeStep && CameraRotationLagSpeed > 0.f)
+		if (bUseCameraLagSubstepping && CameraLagMaxTimeStep > UE_KINDA_SMALL_NUMBER && DeltaTime > CameraLagMaxTimeStep && CameraRotationLagSpeed > 0.f)
 		{
 			const FRotator RotationStep = (DesiredRotation - PreviousDesiredRotation).GetNormalized() * (1.f / DeltaTime);
 			FRotator StepTarget = PreviousDesiredRotation;
@@ -128,13 +135,12 @@ void UCameraMode_ThirdPerson::ApplyCameraLag(const float DeltaTime, const FVecto
 			DesiredRotation.Pitch = FMath::QInterpTo(FQuat(FRotator(PreviousDesiredRotation.Pitch, 0.f, 0.f)), FQuat(FRotator(DesiredRotation.Pitch, 0.f, 0.f)), DeltaTime, CameraRotationLagSpeed).Rotator().Pitch;
 			DesiredRotation.Yaw = FMath::QInterpTo(FQuat(FRotator(0.f, PreviousDesiredRotation.Yaw, 0.f)), FQuat(FRotator(0.f, DesiredRotation.Yaw, 0.f)), DeltaTime, CameraRotationLagSpeed).Rotator().Yaw;
 		}
-
-		PreviousDesiredRotation = DesiredRotation;
 	}
+	PreviousDesiredRotation = DesiredRotation;
 
 	if (bEnableCameraLag)
 	{
-		if (bUseCameraLagSubstepping && DeltaTime > CameraLagMaxTimeStep && CameraLagSpeed > 0.f)
+		if (bUseCameraLagSubstepping && CameraLagMaxTimeStep > UE_KINDA_SMALL_NUMBER && DeltaTime > CameraLagMaxTimeStep && CameraLagSpeed > 0.f)
 		{
 			const FVector LocationStep = (DesiredLocation - PreviousDesiredLocation) * (1.f / DeltaTime);
 			FVector StepTarget = PreviousDesiredLocation;
@@ -177,9 +183,8 @@ void UCameraMode_ThirdPerson::ApplyCameraLag(const float DeltaTime, const FVecto
 			DrawDebugDirectionalArrow(GetWorld(), DesiredLocation + ToPivot, PivotLocation, 7.5f, LineColor);
 		}
 		#endif
-
-		PreviousDesiredLocation = DesiredLocation;
 	}
+	PreviousDesiredLocation = DesiredLocation;
 }
 
 void UCameraMode_ThirdPerson::ApplyTargetOffsetFromRotation(const FRotator& DesiredRotation, FVector& DesiredLocation) const
@@ -283,8 +288,44 @@ void UCameraMode_ThirdPerson::UpdatePreventPenetration(const float DeltaTime)
 		AssistRecipients.Add(PreventPenetrationActor);
 	}
 
-	// Sweep from the pivot (always collision-free by construction) instead of an approximated safe point.
-	const FVector SafeLocation = GetPivotLocation() + CurrentCrouchOffset;
+	const FVector PivotLocation = GetPivotLocation() + CurrentCrouchOffset;
+	const float PushInDistance = (PenetrationAvoidanceFeelers.IsEmpty() ? 0.f : PenetrationAvoidanceFeelers[0].Extent) + CollisionPushOutDistance;
+	FVector SafeLocation = PreventPenetrationActor->GetActorLocation();
+	if (const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(PreventPenetrationActor->GetRootComponent()))
+	{
+		// Keep the sweep origin on the capsule's interior axis even when crouching raises the pivot above it.
+		const FVector CapsuleCenter = Capsule->GetComponentLocation();
+		const FVector CapsuleUp = Capsule->GetUpVector();
+		const float MaxAxisOffset = FMath::Max(0.f, Capsule->GetScaledCapsuleHalfHeight() - FMath::Max(Capsule->GetScaledCapsuleRadius(), PushInDistance));
+		const float AxisOffset = FVector::DotProduct(PivotLocation - CapsuleCenter, CapsuleUp);
+		SafeLocation = CapsuleCenter + CapsuleUp * FMath::Clamp(AxisOffset, -MaxAxisOffset, MaxAxisOffset);
+	}
+	else if (const UBoxComponent* Box = Cast<UBoxComponent>(PreventPenetrationActor->GetRootComponent()))
+	{
+		const FTransform& Transform = Box->GetComponentTransform();
+		const FVector Extent = (Box->GetScaledBoxExtent() - FVector(PushInDistance)).ComponentMax(FVector::ZeroVector);
+		const FVector LocalPivot = Transform.InverseTransformPositionNoScale(PivotLocation);
+		SafeLocation = Transform.TransformPositionNoScale(FVector(
+			FMath::Clamp(LocalPivot.X, -Extent.X, Extent.X),
+			FMath::Clamp(LocalPivot.Y, -Extent.Y, Extent.Y),
+			FMath::Clamp(LocalPivot.Z, -Extent.Z, Extent.Z)));
+	}
+	else if (const USphereComponent* Sphere = Cast<USphereComponent>(PreventPenetrationActor->GetRootComponent()))
+	{
+		const FVector Center = Sphere->GetComponentLocation();
+		const float SafeRadius = FMath::Max(0.f, Sphere->GetScaledSphereRadius() - PushInDistance);
+		SafeLocation = Center + (PivotLocation - Center).GetClampedToMaxSize(SafeRadius);
+	}
+	else if (const UPrimitiveComponent* RootPrimitive = Cast<UPrimitiveComponent>(PreventPenetrationActor->GetRootComponent()))
+	{
+		float DistanceSquared;
+		FVector ClosestPoint;
+		if (RootPrimitive->GetSquaredDistanceToCollision(PivotLocation, DistanceSquared, ClosestPoint))
+		{
+			// Inside queries return the input point, so also move those origins toward the collision center.
+			SafeLocation = ClosestPoint + (RootPrimitive->Bounds.Origin - ClosestPoint).GetClampedToMaxSize(PushInDistance);
+		}
+	}
 
 	const bool bSingleRayPenetrationCheck = !bDoPredictiveAvoidance;
 	PreventCameraPenetration(*PreventPenetrationActor, SafeLocation, View.Location, DeltaTime, AimLineToDesiredPosBlockedPct, bSingleRayPenetrationCheck);
@@ -295,32 +336,47 @@ void UCameraMode_ThirdPerson::UpdatePreventPenetration(const float DeltaTime)
 
 void UCameraMode_ThirdPerson::SetPenetrationNotificationState(const bool bIsPenetrating, const TArray<UObject*>& AssistRecipients)
 {
-	if (bIsPenetrating == bWasPenetratingTarget)
-	{
-		return;
-	}
-
+	const uint32 Revision = ++PenetrationNotificationRevision;
 	bWasPenetratingTarget = bIsPenetrating;
+	TArray<TWeakObjectPtr<UObject>> NewRecipients;
 	if (bIsPenetrating)
 	{
-		PenetrationNotificationRecipients.Reset();
 		for (UObject* Recipient : AssistRecipients)
 		{
 			if (Recipient && Recipient->Implements<UCameraAssistInterface>())
 			{
-				PenetrationNotificationRecipients.AddUnique(TWeakObjectPtr<UObject>(Recipient));
-				ICameraAssistInterface::Execute_OnCameraPenetratingTarget(Recipient);
+				NewRecipients.AddUnique(TWeakObjectPtr<UObject>(Recipient));
 			}
 		}
-		return;
 	}
 
-	TArray<TWeakObjectPtr<UObject>> RecipientsToNotify = MoveTemp(PenetrationNotificationRecipients);
-	for (const TWeakObjectPtr<UObject>& WeakRecipient : RecipientsToNotify)
+	const TArray<TWeakObjectPtr<UObject>> PreviousRecipients = MoveTemp(PenetrationNotificationRecipients);
+	PenetrationNotificationRecipients = PreviousRecipients;
+	for (const TWeakObjectPtr<UObject>& WeakRecipient : PreviousRecipients)
 	{
-		if (UObject* Recipient = WeakRecipient.Get(); Recipient && Recipient->Implements<UCameraAssistInterface>())
+		if (!NewRecipients.Contains(WeakRecipient))
 		{
-			ICameraAssistInterface::Execute_OnCameraStoppedPenetratingTarget(Recipient);
+			PenetrationNotificationRecipients.Remove(WeakRecipient);
+			if (UObject* Recipient = WeakRecipient.Get(); Recipient && Recipient->Implements<UCameraAssistInterface>())
+			{
+				ICameraAssistInterface::Execute_OnCameraStoppedPenetratingTarget(Recipient);
+				if (PenetrationNotificationRevision != Revision)
+				{
+					return;
+				}
+			}
+		}
+	}
+	for (const TWeakObjectPtr<UObject>& WeakRecipient : NewRecipients)
+	{
+		if (UObject* Recipient = WeakRecipient.Get(); Recipient && bWasPenetratingTarget && !PenetrationNotificationRecipients.Contains(WeakRecipient))
+		{
+			PenetrationNotificationRecipients.Add(WeakRecipient);
+			ICameraAssistInterface::Execute_OnCameraPenetratingTarget(Recipient);
+			if (PenetrationNotificationRevision != Revision)
+			{
+				return;
+			}
 		}
 	}
 }
@@ -392,14 +448,27 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 		AppendIgnoredFromAssist(TargetPawn->GetController());
 	}
 	AppendIgnoredFromAssist(GetTargetActor());
+	if (&ViewTarget != GetTargetActor())
+	{
+		AppendIgnoredFromAssist(&ViewTarget);
+	}
 
 	FCollisionShape SphereShape = FCollisionShape::MakeSphere(0.f);
 	UWorld* World = GetWorld();
 	check(World);
 
-	auto ShouldDiscardHit = [&ViewTarget](const FHitResult& CandidateHit, const FCameraPenetrationAvoidanceFeeler& Feeler)
+	auto ShouldDiscardHit = [&ViewTarget, &SphereParams](const FHitResult& CandidateHit, const FCameraPenetrationAvoidanceFeeler& Feeler)
 	{
 		const AActor* HitActor = CandidateHit.GetActor();
+		// Async hits must respect the current target and assist ignore lists.
+		if (HitActor && SphereParams.GetIgnoredSourceObjects().Contains(HitActor->GetUniqueID()))
+		{
+			return true;
+		}
+		if (const UPrimitiveComponent* HitComponent = CandidateHit.GetComponent(); HitComponent && SphereParams.GetIgnoredComponents().Contains(HitComponent->GetUniqueID()))
+		{
+			return true;
+		}
 		if (HitActor && HitActor->ActorHasTag(CameraMode_ThirdPerson_Statics::NAME_IgnoreCameraCollision))
 		{
 			return true;
@@ -425,11 +494,19 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 	{
 		if (const AActor* HitActor = DiscardedHit.GetActor())
 		{
+			if (QueryParams.GetIgnoredSourceObjects().Contains(HitActor->GetUniqueID()))
+			{
+				return false;
+			}
 			QueryParams.AddIgnoredActor(HitActor);
 			return true;
 		}
 		if (const UPrimitiveComponent* HitComponent = DiscardedHit.GetComponent())
 		{
+			if (QueryParams.GetIgnoredComponents().Contains(HitComponent->GetUniqueID()))
+			{
+				return false;
+			}
 			QueryParams.AddIgnoredComponent(HitComponent);
 			return true;
 		}
@@ -444,8 +521,7 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 		const FCameraPenetrationAvoidanceFeeler& Feeler,
 		FHitResult& OutHit)
 	{
-		constexpr int32 MaxDiscardedHitsPerRay = 16;
-		for (int32 Attempt = 0; Attempt < MaxDiscardedHitsPerRay; ++Attempt)
+		while (true)
 		{
 			FHitResult CandidateHit;
 			if (!World->SweepSingleByChannel(CandidateHit, TraceStart, TraceEnd, FQuat::Identity, TraceChannel, TraceShape, QueryParams))
@@ -464,8 +540,6 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 				return false;
 			}
 		}
-
-		return false;
 	};
 
 	for (int32 RayIdx = 0; RayIdx < NumRaysToShoot; ++RayIdx)
@@ -511,12 +585,9 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 						if (ShouldDiscardHit(*BlockingHit, Feeler))
 						{
 							FCollisionQueryParams FollowUpParams = SphereParams;
-							if (AddDiscardedHitToQuery(FollowUpParams, *BlockingHit))
-							{
-								// Ignored hits are uncommon; a synchronous follow-up prevents them from
-								// masking a real blocker without adding another frame of visible clipping.
-								bHit = SweepForRelevantHit(ResultStart, ResultEnd, SphereShape, FollowUpParams, Feeler, Hit);
-							}
+							// Pending hits may already be in the current ignore list, so always repeat the query.
+							AddDiscardedHitToQuery(FollowUpParams, *BlockingHit);
+							bHit = SweepForRelevantHit(ResultStart, ResultEnd, SphereShape, FollowUpParams, Feeler, Hit);
 						}
 						else
 						{
@@ -681,6 +752,11 @@ void UCameraMode_ThirdPerson::PreventCameraPenetration(const AActor& ViewTarget,
 
 void UCameraMode_ThirdPerson::SetTargetCrouchOffset(const FVector& NewTargetOffset)
 {
+	if (NewTargetOffset == TargetCrouchOffset)
+	{
+		return;
+	}
+
 	CrouchOffsetBlendPct = 0.f;
 	InitialCrouchOffset = CurrentCrouchOffset;
 	TargetCrouchOffset = NewTargetOffset;

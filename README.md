@@ -22,6 +22,14 @@ Override `Determine Camera Mode` on a **Blueprint subclass of Camera Mode Compon
 
 Each selected mode is **pushed** onto an internal stack and blends in over its own **Blend Time**. Older modes fall away once fully occluded.
 
+Rotation blends follow each mode's continuous angle path, preserving the view when a partially blended mode is promoted. A mode that turns past 180 degrees during a blend continues along that turn instead of switching to the opposite arc.
+
+When selection returns no mode, the stack is cleared and the component restores its saved relative location, rotation, and FOV before using normal camera behavior. While modes are active, they control the view rotation even if **Use Pawn Control Rotation** is enabled.
+
+If a mode callback changes the stack during evaluation, normal camera behavior is used for that frame and the new stack is evaluated on the next frame.
+
+Deactivating or unregistering the component deactivates its modes and sends any outstanding penetration exit notifications.
+
 ## Camera Modes
 
 ### Base Camera Mode
@@ -67,7 +75,7 @@ free-rotating the camera around the target has no lag, only the target's own mov
 Zoom (Scroll wheel):
 
 - Call **Add Zoom Input** (positive = zoom in) - e.g. `Camera Mode Component → Get Active Camera Mode → Cast To Camera Mode Third Person → Add Zoom Input`
-- **Min/Max Zoom Distance Scale** - how close/far zoom can bring the camera (fraction/multiple of the curve's authored distance)
+- **Min/Max Zoom Distance Scale** - how close/far zoom can bring the camera (fraction/multiple of the curve's authored distance). Bounds apply without zoom input and after runtime changes.
 - **Zoom Step Size** - how much one call moves the target zoom
 - **Zoom Interp Speed** - how fast the camera catches up to the target zoom (0 = instant)
 
@@ -91,6 +99,8 @@ Console command `ModularCameraSystem.ShowDebug 1` draws the local player's Camer
 ## Camera Assist Interface (optional)
 
 Implement **Camera Assist Interface** on the Owning Pawn, its Controller, or a custom target returned via `GetCameraPreventPenetrationTarget` if you need to customize penetration behavior.
+
+For custom penetration targets, prefer a capsule, box, or sphere collision root and keep the main feeler small enough to fit inside it. Other collision roots use a nearest-point fallback.
 
 | Event | Purpose |
 |---|---|

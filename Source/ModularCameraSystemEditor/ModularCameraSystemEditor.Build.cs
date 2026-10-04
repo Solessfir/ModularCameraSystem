@@ -12,6 +12,8 @@ public class ModularCameraSystemEditor : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange([
 			"CoreUObject",
+			"Engine",
+			"ModularCameraSystem",
 			"UnrealEd",
 			"Slate",
 			"SlateCore"
