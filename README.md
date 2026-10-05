@@ -120,8 +120,6 @@ Native regression tests are included in the editor module. Run this command from
 Automation RunTests ModularCameraSystem
 ```
 
-Validated on Linux with Unreal Engine 5.8.3, using Development editor and game builds.
-
 ## License
 
 Licensed under the [MIT License](LICENSE).
